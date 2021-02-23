@@ -1,3 +1,4 @@
+from mmap import ACCESS_COPY
 from msgpack import packb, unpackb
 from hoshino.aiorequests import post
 from random import randint
@@ -5,6 +6,11 @@ from json import loads
 from hashlib import md5
 from Crypto.Cipher import AES
 from base64 import b64encode, b64decode
+from .bsgamesdk import login
+from asyncio import sleep
+from re import search
+from datetime import datetime
+from dateutil.parser import parse
 
 apiroot = 'http://l3-prod-all-gs-gzlj.bilibiligame.net'
 
@@ -35,31 +41,53 @@ class ApiException(Exception):
         super().__init__(message)
         self.code = code
 
-class pcrclient:
+class bsdkclient:
     '''
         acccountinfo = {
-            'uid': '',
-            'access_key': '',
+            'account': '',
+            'password': '',
             'platform': 2, # indicates android platform
-            'channel': 1, #indicates bilibili channel
+            'channel': 1, # indicates bilibili channel
         }
     '''
-    def __init__(self, accountinfo: dict):
+    def __init__(self, acccountinfo, captchaVerifier, errlogger):
+        self.account = acccountinfo['account']
+        self.pwd = acccountinfo['password']
+        self.platform = acccountinfo['platform']
+        self.channel = acccountinfo['channel']
+        self.captchaVerifier = captchaVerifier
+        self.errlogger = errlogger
+    async def login(self):
+        while True:
+            resp = await login(self.account, self.pwd, self.captchaVerifier)
+            if resp['code'] == 0:
+                break
+            await self.errlogger(resp['message'])
+        
+        return resp['uid'], resp['access_key']
+        
+    
+class pcrclient:
+    def __init__(self, bsclient: bsdkclient):
         self.viewer_id = 0
-        self.uid = accountinfo['uid']
-        self.access_key = accountinfo['access_key']
-        self.platform = accountinfo['platform']
-        self.channel = accountinfo['channel']
+        self.bsdk = bsclient
 
         self.headers = {}
         for key in defaultHeaders.keys():
             self.headers[key] = defaultHeaders[key]
+
+        self.shouldLogin = True
+        self.shouldLoginB = True
+
+    async def bililogin(self):
+        self.uid, self.access_key = await self.bsdk.login()
+        self.platform = self.bsdk.platform
+        self.channel = self.bsdk.channel
         self.headers['PLATFORM'] = str(self.platform)
         self.headers['PLATFORM-ID'] = str(self.platform)
         self.headers['CHANNEL-ID'] = str(self.channel)
-
-        self.shouldLogin = True
-
+        self.shouldLoginB = False
+    
     @staticmethod
     def createkey() -> bytes:
         return bytes([ord('0123456789abcdef'[randint(0, 15)]) for _ in range(32)])
@@ -97,7 +125,7 @@ class pcrclient:
             strict_map_key = False
         ), data[-32:]
 
-    async def callapi(self, apiurl: str, request: dict, crypted: bool = True):
+    async def callapi(self, apiurl: str, request: dict, crypted: bool = True, noerr: bool = False):
         key = pcrclient.createkey()
 
         try:    
@@ -125,7 +153,7 @@ class pcrclient:
                 self.viewer_id = data_headers['viewer_id']
         
             data = response['data']
-            if 'server_error' in data:
+            if not noerr and 'server_error' in data:
                 data = data['server_error']
                 print(f'pcrclient: {apiurl} api failed {data}')
                 raise ApiException(data['message'], data['status'])
@@ -137,24 +165,46 @@ class pcrclient:
             raise
     
     async def login(self):
+        if self.shouldLoginB:
+            await self.bililogin()
+        
         if 'REQUEST-ID' in self.headers:
             self.headers.pop('REQUEST-ID')
 
-        manifest = await self.callapi('/source_ini/get_maintenance_status?format=json', {}, False)
+        while True:
+            manifest = await self.callapi('/source_ini/get_maintenance_status?format=json', {}, False, noerr = True)
+            if 'maintenance_message' not in manifest:
+                break
+
+            try:
+                match = search('\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d', manifest['maintenance_message']).group()
+                end = parse(match)
+                print(f'server is in maintenance until {match}')
+                while datetime.now() < end:
+                    await sleep(1)
+            except:
+                print(f'server is in maintenance. waiting for 60 secs')
+                await sleep(60)
+
         ver = manifest['required_manifest_ver']
         print(f'using manifest ver = {ver}')
         self.headers['MANIFEST-VER'] = str(ver)
-        await self.callapi('/tool/sdk_login', {
+        lres = await self.callapi('/tool/sdk_login', {
             'uid': str(self.uid),
             'access_key': self.access_key,
             'channel': str(self.channel),
             'platform': str(self.platform)
         })
+        if 'is_risk' in lres and lres['is_risk'] == 1:
+            self.shouldLoginB = True
+            return
+        
         gamestart = await self.callapi('/check/game_start', {
             'apptype': 0,
             'campaign_data': '',
             'campaign_user': randint(0, 99999)
         })
+
         if not gamestart['now_tutorial']:
             raise Exception("该账号没过完教程!")
             
@@ -171,3 +221,5 @@ class pcrclient:
         })
 
         self.shouldLogin = False
+
+
